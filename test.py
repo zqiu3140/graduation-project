@@ -21,7 +21,6 @@ SIMILARITY_THRESHOLD_SECOND = 0.835
 CACHE_PATH = r"D:\\1114534\\畢專程式測試\\暫存\\pinyin_cache.json"
 file_path = r"D:\\1114534\\畢專程式測試\\暫存\\generated_subtitles1.txt"
 output_dir = r"D:\\1114534\\畢專程式測試\\暫存"
-OUTPUT_FILE_PATH = r"D:\\1114534\\畢專程式測試\\暫存\\matching_results.txt"
 
 os.makedirs(output_dir, exist_ok=True)
 
