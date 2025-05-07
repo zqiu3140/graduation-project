@@ -1,0 +1,5 @@
+python python_setup_dependencies.py 
+
+Do it first.
+
+請先執行該程式
