@@ -75,6 +75,11 @@ def group_photos_by_exif_date(photo_files):
                 photo_groups[day].append(photo)
     
     return photo_groups
+# 添加新端點，與 Flutter 應用匹配
+@app.post("/Memory_genre")
+async def create_memory_genre(request: MemoryRequest, background_tasks: BackgroundTasks):
+    # 直接呼叫現有函數，避免重複代碼
+    return await create_memory(request, background_tasks)
 
 @app.post("/generate-memory")
 async def create_memory(request: MemoryRequest, background_tasks: BackgroundTasks):
@@ -98,56 +103,81 @@ async def create_memory(request: MemoryRequest, background_tasks: BackgroundTask
 
 async def process_memory_generation(title: str, trip_id: str, user_id: str, style: str):
     try:
-        # 創建臨時目錄存放照片
         temp_dir = tempfile.mkdtemp()
-        photo_files = []
         
-        # 從Firebase獲取行程相關照片
-        photos_ref = db.collection('trip_photos').where('trip_id', '==', trip_id).get()
-        
-        # 獲取行程日期範圍
+        # 從 Firebase 獲取行程資訊
         trip_doc = db.collection('trips').document(trip_id).get()
         trip_data = trip_doc.to_dict()
         start_date = trip_data.get('start_date')
         end_date = trip_data.get('end_date')
         
-        for photo in photos_ref:
-            photo_data = photo.to_dict()
-            photo_url = photo_data.get('url')
-            
-            if photo_url:
-                # 從URL下載照片
-                blob = bucket.blob(photo_url.replace('gs://' + bucket.name + '/', ''))
-                filename = f"{uuid.uuid4().hex}.jpg"
-                local_path = os.path.join(temp_dir, filename)
-                blob.download_to_filename(local_path)
-                photo_files.append(local_path)
+        # 計算行程天數
+        start = datetime.strptime(start_date, '%Y-%m-%d')
+        end = datetime.strptime(end_date, '%Y-%m-%d')
+        days = (end - start).days + 1
         
-        if not photo_files:
+        # 直接按照天數分組獲取照片
+        photo_groups = {}
+        total_photos = 0
+        
+        for day in range(1, days + 1):
+            day_id = f'day{day}'
+            photos_ref = db.collection('trips').document(trip_id).collection('albums').document(day_id).collection('photos').order_by('timestamp').get()
+            
+            photos_for_day = []
+            for photo in photos_ref:
+                photo_data = photo.to_dict()
+                photo_url = photo_data.get('url')
+                
+                if photo_url:
+                    try:
+                        # 改進的 URL 處理方式
+                        if photo_url.startswith('gs://'):
+                            # 直接使用 gs:// 路徑
+                            blob_path = photo_url.replace(f'gs://{bucket.name}/', '')
+                        else:
+                            # 對於 HTTPS URL，使用更可靠的方法提取路徑
+                            url_parts = photo_url.split('/')
+                            if 'firebasestorage.googleapis.com' in photo_url:
+                                # 提取標準 Firebase Storage URL 路徑
+                                obj_path = url_parts[-1].split('?')[0]
+                                blob_path = f"trips/{trip_id}/albums/{day_id}/{obj_path}"
+                            else:
+                                # 回退方案
+                                blob_path = f"trips/{trip_id}/albums/{day_id}/{url_parts[-1]}"
+                        
+                        # 嘗試獲取 blob
+                        blob = bucket.blob(blob_path)
+                        
+                        filename = f"{uuid.uuid4().hex}.jpg"
+                        local_path = os.path.join(temp_dir, filename)
+                        blob.download_to_filename(local_path)
+                        photos_for_day.append(local_path)
+                        total_photos += 1
+                    except Exception as e:
+                        print(f"下載照片時出錯: {e}, URL: {photo_url}")
+            
+            if photos_for_day:  # 只添加有照片的日期
+                photo_groups[day] = photos_for_day
+        
+        if total_photos == 0:
             raise Exception("此行程沒有關聯的照片")
         
-        # 使用EXIF數據按日期分組照片
-        photo_groups = group_photos_by_exif_date(photo_files)
-        
-        # 如果分組為空，做一個簡單的分組（所有照片放在第1天）
-        if not photo_groups:
-            photo_groups = {1: photo_files}
-        
-        # 生成PDF
+        # 生成 PDF
         output_dir = tempfile.mkdtemp()
         generate_pdf(title, photo_groups, style=style, output_dir=output_dir)
         
-        # 取得生成的PDF文件名稱
+        # 上傳生成的 PDF
         pdf_filename = f"{title}_{style}.pdf"
         pdf_path = os.path.join(output_dir, pdf_filename)
         
-        # 上傳PDF到Firebase Storage
+        # 上傳 PDF 到 Firebase Storage
         pdf_blob = bucket.blob(f"memories/{user_id}/{pdf_filename}")
         pdf_blob.upload_from_filename(pdf_path)
         pdf_url = f"gs://{bucket.name}/memories/{user_id}/{pdf_filename}"
         
-        # 將記錄保存到Firestore
-        db.collection('memories').add({
+        # 將記錄保存到 Firestore
+        memory_doc = db.collection('memories').add({
             'title': title,
             'trip_id': trip_id,
             'user_id': user_id,
@@ -156,17 +186,36 @@ async def process_memory_generation(title: str, trip_id: str, user_id: str, styl
             'created_at': firestore.SERVER_TIMESTAMP
         })
         
+        # 添加通知
+        db.collection('users').document(user_id).collection('notifications').add({
+            'type': 'memory_generated',
+            'title': f'您的"{title}"回憶錄已生成完成',
+            'message': f'您的旅行回憶錄已準備好，請點擊查看',
+            'pdf_url': pdf_url,
+            'created_at': firestore.SERVER_TIMESTAMP,
+            'read': False
+        })
+        
         # 清理臨時文件
-        for file in photo_files:
-            if os.path.exists(file):
-                os.remove(file)
+        for day_photos in photo_groups.values():
+            for file in day_photos:
+                if os.path.exists(file):
+                    os.remove(file)
         os.remove(pdf_path)
         
     except Exception as e:
         print(f"處理回憶錄生成時出錯: {e}")
-        # 可以添加錯誤處理邏輯，例如通知用戶
+        # 添加錯誤通知
+        if user_id:
+            db.collection('users').document(user_id).collection('notifications').add({
+                'type': 'memory_error',
+                'title': '回憶錄生成失敗',
+                'message': f'生成"{title}"時遇到問題: {str(e)}',
+                'created_at': firestore.SERVER_TIMESTAMP,
+                'read': False
+            })
 
 # 啟動服務
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=5001)
