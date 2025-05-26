@@ -6,21 +6,29 @@ import torch
 import traceback
 import Levenshtein
 import mysql.connector
+from time import time
 from yt_dlp import YoutubeDL
 from pypinyin import lazy_pinyin
 from mysql.connector import Error
 from difflib import SequenceMatcher
 from collections import defaultdict
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 app = Flask(__name__)
 
+# === 全域載入 WhisperModel 與 BatchedInferencePipeline ===
+device = "cuda" if torch.cuda.is_available() else "cpu"
+compute_type = "float16" if device == "cuda" else "int8"
+global_whisper_model = WhisperModel(
+    "large-v2", device=device, compute_type=compute_type)
+global_batched_model = BatchedInferencePipeline(model=global_whisper_model)
+
 # === 設定 ===
-SIMILARITY_THRESHOLD_FIRST = 0.94
+# 路徑請自行設定
 SIMILARITY_THRESHOLD_SECOND = 0.835
-CACHE_PATH = r"D:\\1114534\\畢專程式測試\\暫存\\pinyin_cache.json"
-file_path = r"D:\\1114534\\畢專程式測試\\暫存\\generated_subtitles1.txt"
-output_dir = r"D:\\1114534\\畢專程式測試\\暫存"
+CACHE_PATH = r"D:\\MIS_Final\\pinyin_cache.json"
+file_path = r"D:\\MIS_Final\\audio_text\\generated_subtitles1.txt"
+output_dir = r"D:\\MIS_Final\\audio_text"
 
 os.makedirs(output_dir, exist_ok=True)
 
@@ -128,19 +136,15 @@ def generate_subtitle_if_needed(audio_file, subtitle_path, output_dir, cleaned_s
 
 
 # === 使用 Whisper 生成字幕 ===
-def generate_subtitle_with_whisper(audio_file, output_dir):
+def generate_subtitle_with_whisper(audio_file, output_dir, language="zh"):
     """
-    使用 Whisper 生成字幕。
-    Args:
-        audio_file (str): 音訊檔案的路徑。
-        output_dir (str): 輸出字幕檔案的目錄。
-    Returns:
-        str: 生成的字幕檔案的路徑。
+    使用全域 Whisper 生成字幕。
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
-    model = WhisperModel("medium", device=device, compute_type=compute_type)
-    segments, _ = model.transcribe(audio_file, language="zh")
+    # 使用全域已載入的模型
+    segments, _ = global_batched_model.transcribe(
+        audio_file, beam_size=5, batch_size=8, language=language)
+    # segments, _ = model.transcribe(
+    #     audio_file, language=language, beam_size=3, no_speech_threshold=0.4)
     full_text = "".join([segment.text for segment in segments])
     subtitle_path = os.path.join(output_dir, "generated_subtitles.txt")
     with open(subtitle_path, "w", encoding="utf-8") as f:
@@ -240,8 +244,13 @@ def get_char_pinyin(char: str) -> str:
 # === 將景點名稱轉換為拼音並存儲在字典中 ===
 def spot_names_to_pinyin(spot_names):
     spot_pinyin_dict = defaultdict(list)
+    pinyin_cache_local = {}
     for spot_name in spot_names:
-        pinyin = lazy_pinyin(spot_name)
+        if spot_name in pinyin_cache_local:
+            pinyin = pinyin_cache_local[spot_name]
+        else:
+            pinyin = lazy_pinyin(spot_name)
+            pinyin_cache_local[spot_name] = pinyin
         spot_pinyin_str = ' '.join(pinyin)
         spot_pinyin_dict[spot_pinyin_str].append(spot_name)
     return spot_pinyin_dict
@@ -327,6 +336,9 @@ def compare_location_with_layers(transcript_pinyin_list, spot_pinyin_dict):
 # === Flask ===
 @app.route('/process_video', methods=['POST'])
 def process_video():
+    start_time = time()
+    audio_file = None
+
     data = request.json
     video_url = data.get('video_url')
 
@@ -363,8 +375,6 @@ def process_video():
 
         if not transcript.strip():
             raise Exception("字幕檔案內容為空，請檢查字幕清理邏輯。")
-        print(f"字幕內容長度：{len(transcript)}")
-        print(f"字幕內容預覽：{transcript[:100]}")
 
         # 從標題中提取縣市和行政區名稱
         loc_names, area_names = extract_location_from_title(
@@ -378,19 +388,18 @@ def process_video():
         # 根據縣市和行政區篩選景點
         if loc_names:
             query = """
-                SELECT loc_name, area_name, spot_name
-                FROM Location, Area, Spot
-                WHERE Location.loc_id = Area.loc_id
-                AND Area.area_id = Spot.area_id
-                AND Location.loc_name IN (%s)
-            """ % (", ".join(["%s"] * len(loc_names)))
-
+                SELECT Spot.spot_name
+                FROM Location
+                JOIN Area ON Location.loc_id = Area.loc_id
+                JOIN Spot ON Area.area_id = Spot.area_id
+                WHERE Location.loc_name IN ({})
+            """.format(','.join(['%s'] * len(loc_names)))
             params = loc_names
 
             if area_names:
-                query += " AND Area.area_name IN (%s)" % (
-                    ", ".join(["%s"] * len(area_names)))
-                params.extend(area_names)
+                query += " AND Area.area_name IN ({})".format(
+                    ','.join(['%s'] * len(area_names)))
+                params += area_names
 
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -398,7 +407,6 @@ def process_video():
             if not rows:
                 print("資料庫查詢結果為空")
                 raise Exception("資料庫中沒有符合條件的資料")
-            print(f"查詢結果數量：{len(rows)}")
 
         # 提取景點名稱
         spot_names = [row['spot_name'] for row in rows]
@@ -418,24 +426,17 @@ def process_video():
         if not results["first_layer"] and not results["second_layer"]:
             raise Exception("未找到任何匹配的景點")
 
-        # 提取匹配的景點名稱（合併第一層和第二層）
-        matched_places = []
-
-        # 合併第一層結果
+        # 收集所有匹配到的地點名稱（用 set 加速去重）
+        matched_places_set = set()
         for match in results["first_layer"].values():
-            matched_places.append({
-                "spot_names": match["spot_names"],
-                "match": match["match"]
-            })
-
-        # 合併第二層結果
+            matched_places_set.update(match["spot_names"])
         for match in results["second_layer"].values():
-            matched_places.append({
-                "spot_names": match["spot_names"],
-                "match": match["match"],
-                "similarity": match["similarity"]
-            })
+            matched_places_set.update(match["spot_names"])
+        matched_places = list(matched_places_set)
 
+        end_time = time()
+        elapsed_time = end_time - start_time
+        print(f"處理時間：{elapsed_time:.2f}秒")
         return jsonify({
             'status': 'success',
             'matched_places': matched_places
